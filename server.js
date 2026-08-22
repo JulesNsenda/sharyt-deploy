@@ -571,6 +571,36 @@ function parseAmountToCents(input) {
 var PAY_MODES = ["equal", "items", "full"];
 var STAFF_ROLES = ["owner", "manager", "cashier", "viewer"];
 
+// packages/shared/dist/permissions.js
+var PERMISSIONS = {
+  owner: ["*"],
+  manager: [
+    "table.manage",
+    "session.open",
+    "session.close",
+    "session.close_short",
+    "session.amend_bill",
+    "payment.verify",
+    "payment.void",
+    "report.read",
+    "receipt.print",
+    "staff.manage",
+    "settings.manage"
+  ],
+  cashier: [
+    "session.open",
+    "session.close",
+    "session.amend_bill",
+    "payment.verify",
+    "receipt.print"
+  ],
+  viewer: ["report.read"]
+};
+function can(role, permission) {
+  const granted = PERMISSIONS[role];
+  return granted.includes("*") || granted.includes(permission);
+}
+
 // packages/shared/dist/schemas.js
 import { z } from "zod";
 var tableCodeSchema = z.string().trim().min(1, "Give the table a code.").max(16, "Keep table codes short enough to print.").regex(/^[A-Za-z0-9][A-Za-z0-9-]*$/, "Letters, numbers and hyphens only.");
@@ -3779,34 +3809,6 @@ function translate(err, code) {
 }
 
 // apps/server/src/db/staff.ts
-var PERMISSIONS = {
-  owner: ["*"],
-  manager: [
-    "table.manage",
-    "session.open",
-    "session.close",
-    "session.close_short",
-    "session.amend_bill",
-    "payment.verify",
-    "payment.void",
-    "report.read",
-    "receipt.print",
-    "staff.manage",
-    "settings.manage"
-  ],
-  cashier: [
-    "session.open",
-    "session.close",
-    "session.amend_bill",
-    "payment.verify",
-    "receipt.print"
-  ],
-  viewer: ["report.read"]
-};
-function can(role, permission) {
-  const granted = PERMISSIONS[role];
-  return granted.includes("*") || granted.includes(permission);
-}
 var U_COLS = `id, email, display_name, role, totp_secret_enc, created_at, last_login_at, disabled_at`;
 function mapUser(r) {
   return {
