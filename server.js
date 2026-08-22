@@ -4429,7 +4429,10 @@ async function dailyTakings(t, days = 30) {
         WHERE s.status IN ('paid', 'short', 'closed')
           AND coalesce(s.closed_at, s.created_at) > now() - ($1 || ' days')::interval
      )
-     SELECT day,
+     -- Formatted in SQL, not in JS: a date column comes back from pg as a
+     -- Date at local midnight, and turning that into an ISO day in a
+     -- positive-offset timezone lands on the day before.
+     SELECT to_char(day, 'YYYY-MM-DD')          AS day,
             count(*)::int                       AS sessions,
             coalesce(sum(payers), 0)::int       AS diners_paid,
             coalesce(sum(taken), 0)             AS takings,
@@ -5867,11 +5870,19 @@ function createApp(ctx) {
     });
   });
   app.use("/api", notFoundHandler);
+  const dist = webDistDir();
+  const hasBuild = existsSync3(path3.join(dist, "index.html"));
+  app.get(
+    "/:slug/t/:code",
+    guardSlug,
+    (req, res, next) => {
+      if (!hasBuild || req.accepts(["json", "html"]) !== "html") return next();
+      res.sendFile(path3.join(dist, "index.html"));
+    }
+  );
   app.use("/:slug/t/:code", guardSlug, tableRoutes(ctx));
   app.use("/:slug/mock", guardSlug, mockRoutes(ctx));
   app.use("/:slug/pay", guardSlug, payRoutes(ctx));
-  const dist = webDistDir();
-  const hasBuild = existsSync3(path3.join(dist, "index.html"));
   const sentinelDist = sentinelDistDir();
   const hasSentinel = existsSync3(path3.join(sentinelDist, "index.html"));
   if (hasSentinel) {
