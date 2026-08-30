@@ -369,6 +369,32 @@ var RegistryRepository = class {
     );
     return row ? map(row) : null;
   }
+  /**
+   * Resolve a link a diner actually scanned, current or retired.
+   *
+   * A rename does not reprint the stickers. Every slug a restaurant has ever
+   * held stays in `retired_slugs` pointing at it -- that is what stops the
+   * handle being reissued to anybody else -- so an old sticker still names
+   * exactly one restaurant and can be honoured rather than answered with a
+   * table that is not open. There is no ambiguity to resolve: the slug is the
+   * primary key there, and the row is never handed on.
+   *
+   * The diner plane only. Staff sign in through the link they were given and
+   * the portal should converge on the current one.
+   */
+  async byLinkSlug(slug) {
+    const current = await this.bySlug(slug);
+    if (current) return current;
+    const retired = await this.db.withRegistry(
+      (q) => q.one(
+        "SELECT restaurant_id FROM retired_slugs WHERE slug = $1",
+        [slug.normalize("NFKC").trim()]
+      )
+    );
+    if (!retired) return null;
+    const restaurant = await this.byId(retired.restaurant_id);
+    return restaurant && restaurant.archivedAt === null ? restaurant : null;
+  }
   async byId(id) {
     const row = await this.db.withRegistry(
       (q) => q.one(`SELECT ${COLUMNS} FROM restaurants WHERE id = $1`, [id])
@@ -467,8 +493,11 @@ var RegistryRepository = class {
       if (!current) throw new SlugRejected("No such restaurant.");
       const discriminator = current.slug_discriminator ?? newDiscriminator();
       const slug = `${base}-${discriminator}`;
-      const taken = await q.one("SELECT slug FROM retired_slugs WHERE slug = $1", [slug]);
-      if (taken && taken.slug !== current.slug) {
+      const taken = await q.one(
+        "SELECT restaurant_id FROM retired_slugs WHERE slug = $1",
+        [slug]
+      );
+      if (taken && taken.restaurant_id !== restaurantId) {
         throw new SlugRejected("That link has been used before and cannot be reissued.");
       }
       await q("INSERT INTO retired_slugs (slug, restaurant_id) VALUES ($1, $2) ON CONFLICT DO NOTHING", [
@@ -728,6 +757,9 @@ var smtpSettingsSchema = z.object({
   fromName: z.string().trim().max(80).optional(),
   fromAddress: z.string().trim().max(200).optional()
 });
+var publicUrlSchema = z.object({
+  url: z.string().trim().min(1).max(300)
+});
 var subscriptionSchema = z.object({
   plan: z.enum(["trial", "starter", "standard", "unlimited"]).optional(),
   planStatus: z.enum(["active", "past_due", "cancelled"]).optional(),
@@ -773,9 +805,10 @@ var BILL_SCAN_JSON_SCHEMA = {
     notes: { type: ["string", "null"], description: "Anything unreadable or unusual about this slip" }
   }
 };
+var MAX_BILL_IMAGE_BASE64 = 4e6;
 var scanBillSchema = z.object({
-  /** Base64 without the data: prefix. Capped so one diner cannot exhaust a spend. */
-  imageBase64: z.string().min(100).max(12e6),
+  /** Base64 without the data: prefix. */
+  imageBase64: z.string().min(100).max(MAX_BILL_IMAGE_BASE64, "That photo is too large. Take another one."),
   mediaType: z.enum(["image/jpeg", "image/png", "image/webp"])
 });
 
@@ -865,6 +898,83 @@ function allocateProportionalLocal(amount, weights, offset) {
   return out;
 }
 
+// apps/server/src/services/publicUrl.ts
+var KEY = "public_url";
+var PublicUrlStore = class {
+  constructor(db, fromEnv) {
+    this.db = db;
+    this.fromEnv = fromEnv;
+  }
+  cached = null;
+  /** The configured address, or null when nobody has said. Never a guess. */
+  async get() {
+    if (this.fromEnv) return normalisePublicUrl(this.fromEnv);
+    if (this.cached) return this.cached.value;
+    const rows = await this.db.withRegistry(
+      (q) => q("SELECT value FROM platform_settings WHERE key = $1", [KEY])
+    );
+    const value = rows[0]?.value?.trim() || null;
+    this.cached = { value };
+    return value;
+  }
+  /** True when the environment pinned it, so the UI can render it as locked. */
+  get pinnedByEnvironment() {
+    return this.fromEnv !== null && this.fromEnv.trim() !== "";
+  }
+  async set(raw) {
+    const value = normalisePublicUrl(raw);
+    await this.db.withRegistry(
+      (q) => q(
+        `INSERT INTO platform_settings (key, value, is_secret, updated_at)
+         VALUES ($1, $2, false, now())
+         ON CONFLICT (key) DO UPDATE
+           SET value = EXCLUDED.value, updated_at = now()`,
+        [KEY, value]
+      )
+    );
+    this.cached = null;
+    return value;
+  }
+};
+function normalisePublicUrl(raw) {
+  const trimmed = raw.trim().replace(/\/+$/, "");
+  let url;
+  try {
+    url = new URL(trimmed);
+  } catch {
+    throw new Error("That is not a full address. Include the scheme, as in https://sharyt.example.com.");
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw new Error("The address must be http or https.");
+  }
+  if (url.pathname !== "/" || url.search || url.hash) {
+    throw new Error("Give the address only -- no path, query or fragment.");
+  }
+  return url.origin;
+}
+function isLoopbackOrigin(origin) {
+  if (!origin) return false;
+  try {
+    const { hostname } = new URL(origin);
+    return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]" || hostname === "::1";
+  } catch {
+    return false;
+  }
+}
+var NoPublicUrl = class extends Error {
+  constructor() {
+    super(
+      "This deployment has no public address configured, so an emailed link would point nowhere. Set it in Sentinel, or start the server with PUBLIC_URL."
+    );
+  }
+};
+async function mailBaseUrl(store, requestOrigin5) {
+  const configured = await store.get();
+  if (configured) return configured;
+  if (isLoopbackOrigin(requestOrigin5)) return requestOrigin5;
+  throw new NoPublicUrl();
+}
+
 // apps/server/src/middleware/errors.ts
 import { ZodError } from "zod";
 var ApiError = class _ApiError extends Error {
@@ -898,6 +1008,17 @@ var ApiError = class _ApiError extends Error {
 function notFoundHandler(_req, res) {
   res.status(404).json({ ok: false, error: "No such route." });
 }
+function clientErrorStatus(err) {
+  if (typeof err !== "object" || err === null) return null;
+  const e = err;
+  return typeof e.status === "number" && e.status >= 400 && e.status < 500 && e.expose === true ? e.status : null;
+}
+function clientErrorMessage(status, req) {
+  if (status === 413) {
+    return req.path.endsWith("/scan") ? "That was too big to send. Take the photo again." : "That request was too large.";
+  }
+  return "That request was not something we could read.";
+}
 function errorHandler(err, req, res, _next) {
   if (res.headersSent) return;
   if (err instanceof ZodError) {
@@ -912,6 +1033,15 @@ function errorHandler(err, req, res, _next) {
   if (err instanceof ApiError) {
     if (err.status >= 500) console.error(`[${req.method} ${req.path}]`, err.message);
     res.status(err.status).json({ ok: false, error: err.message, details: err.details });
+    return;
+  }
+  const status = clientErrorStatus(err);
+  if (status !== null) {
+    res.status(status).json({ ok: false, error: clientErrorMessage(status, req) });
+    return;
+  }
+  if (err instanceof NoPublicUrl) {
+    res.status(503).json({ ok: false, error: err.message });
     return;
   }
   console.error(`[${req.method} ${req.path}]`, err);
@@ -2340,7 +2470,16 @@ var LIMITS = {
    * lock and host ejection are.
    */
   codeMiss: { limit: 30, windowMs: 6e4 },
-  /** Per table as well as per IP: rotating X-Forwarded-For is free. */
+  /**
+   * Misses at one table, counted per table rather than per caller: this is the
+   * ceiling that still holds when `req.ip` is a fiction.
+   */
+  codeMissTable: { limit: 40, windowMs: 3e5 },
+  /**
+   * Joining is unauthenticated and creates a participant, so it is capped in
+   * both directions: per table, which is the roster somebody could flood, and
+   * per address. A diner whose device is already on the roster spends neither.
+   */
   joinPerTable: { limit: 40, windowMs: 3e5 },
   join: { limit: 30, windowMs: 6e4 },
   /** Vision calls cost real money; the host is the only one who can make them. */
@@ -3340,15 +3479,21 @@ function tableRoutes(ctx) {
   async function inTable(req, fn, opts = {}) {
     const slug = String(req.params.slug ?? "");
     const code = String(req.params.code ?? "");
-    const restaurant = await ctx.registry.bySlug(slug);
+    const restaurant = await ctx.registry.byLinkSlug(slug);
     if (!restaurant) {
-      throttleMiss(req, slug, code);
+      throttleMiss(req, null, null);
+      throw ApiError.notFound("This table is not open yet. Ask your server to start it.");
+    }
+    if (!tableCodeSchema.safeParse(code).success) {
+      throttleMiss(req, restaurant.id, null);
       throw ApiError.notFound("This table is not open yet. Ask your server to start it.");
     }
     const pending = [];
     let channel = null;
+    let tableId = null;
     const out = await ctx.tenant(restaurant.id, async (t) => {
       const table = await t.tables.byCode(code);
+      tableId = table?.id ?? null;
       const session = table ? opts.allowClosed ? await t.sessions.readableForTable(table.id, readDevice(req, ctx.appKey).hash) : await t.sessions.liveForTable(table.id) : null;
       if (!session) return null;
       channel = channelFor(t.restaurantId, session.id);
@@ -3359,26 +3504,46 @@ function tableRoutes(ctx) {
       });
     });
     if (out === null && pending.length === 0 && channel === null) {
-      throttleMiss(req, slug, code);
+      throttleMiss(req, restaurant.id, tableId);
       throw ApiError.notFound("This table is not open yet. Ask your server to start it.");
     }
     for (const p of pending) ctx.events.broadcast(channel, p.event, p.data ?? {});
     return out;
   }
-  function throttleMiss(req, slug, code) {
+  function throttleMiss(req, restaurantId, tableId) {
     const ip = req.ip ?? "unknown";
+    if (!ctx.limiter.peek(platformKey("code-miss", ip), LIMITS.codeMiss.limit)) {
+      throw ApiError.tooMany("Too many attempts. Wait a minute.");
+    }
     const byIp = ctx.limiter.hit(
-      tenantKey(slug, "code-miss", ip),
+      restaurantId === null ? platformKey("code-miss", ip) : tenantKey(restaurantId, "code-miss", ip),
       LIMITS.codeMiss.limit,
       LIMITS.codeMiss.windowMs
     );
+    if (!byIp.allowed) throw ApiError.tooMany("Too many attempts. Wait a minute.");
+    if (restaurantId === null) return;
     const byTable = ctx.limiter.hit(
-      tenantKey(slug, "code-miss-table", code),
+      tenantKey(restaurantId, "code-miss-table", tableId ?? "no-such-code"),
+      LIMITS.codeMissTable.limit,
+      LIMITS.codeMissTable.windowMs
+    );
+    if (!byTable.allowed) {
+      throw ApiError.notFound("This table is not open yet. Ask your server to start it.");
+    }
+  }
+  function throttleJoin(req, l) {
+    const byTable = ctx.limiter.hit(
+      tenantKey(l.t.restaurantId, "join-table", l.session.id),
       LIMITS.joinPerTable.limit,
       LIMITS.joinPerTable.windowMs
     );
-    if (!byIp.allowed || !byTable.allowed) {
-      throw ApiError.tooMany("Too many attempts. Wait a minute.");
+    const byIp = ctx.limiter.hit(
+      tenantKey(l.t.restaurantId, "join", req.ip ?? "unknown"),
+      LIMITS.join.limit,
+      LIMITS.join.windowMs
+    );
+    if (!byTable.allowed || !byIp.allowed) {
+      throw ApiError.tooMany("Too many people joining at once. Wait a minute.");
     }
   }
   async function member(l, req) {
@@ -3410,6 +3575,7 @@ function tableRoutes(ctx) {
       if (!already && l.session.headcountLockedAt !== null) {
         throw ApiError.conflict("This table is already counted. Ask the host to add you.");
       }
+      if (!already) throttleJoin(req, l);
       let result;
       try {
         result = await l.t.sessions.join(l.session.id, {
@@ -3583,7 +3749,7 @@ function tableRoutes(ctx) {
   });
   router.post("/checkout", async (req, res) => {
     const body = checkoutSchema.parse(req.body ?? {});
-    const origin = ctx.publicUrl ?? `${req.protocol}://${req.get("host") ?? "localhost:3000"}`;
+    const origin = await ctx.publicUrls.get() ?? requestOrigin(req);
     const out = await inTable(req, async (l) => {
       const me = await member(l, req);
       const table = await l.t.tables.byId(l.session.tableId);
@@ -3691,6 +3857,9 @@ async function settleAndBroadcast(ctx, t, sessionId) {
   const channel = channelFor(t.restaurantId, sessionId);
   ctx.events.broadcast(channel, "payments", {});
   if (settled) ctx.events.broadcast(channel, "settled", {});
+}
+function requestOrigin(req) {
+  return `${req.protocol}://${req.get("host") ?? "localhost:3000"}`;
 }
 
 // apps/server/src/routes/staff.ts
@@ -4166,13 +4335,13 @@ async function consumeToken(ctx, token, purpose) {
   return row ? { restaurantId: row.restaurant_id, userId: row.user_id } : null;
 }
 async function sendVerification(ctx, input) {
+  const base = await mailBaseUrl(ctx.publicUrls, input.requestOrigin);
   const token = await issueToken(ctx, {
     restaurantId: input.restaurantId,
     userId: input.userId,
     purpose: "verify_email",
     ttlHours: VERIFY_TTL_HOURS
   });
-  const base = ctx.publicUrl ?? "http://localhost:3000";
   return ctx.mail.send(
     verifyEmailMessage({
       to: input.email,
@@ -4191,6 +4360,7 @@ async function verifyEmail(ctx, token) {
   return true;
 }
 async function requestPasswordReset(ctx, input) {
+  const base = await mailBaseUrl(ctx.publicUrls, input.requestOrigin);
   const restaurant = await ctx.registry.bySlug(input.slug);
   if (!restaurant) return { sent: false };
   const user = await ctx.tenant(
@@ -4207,7 +4377,6 @@ async function requestPasswordReset(ctx, input) {
     purpose: "reset_password",
     ttlHours: RESET_TTL_HOURS
   });
-  const base = ctx.publicUrl ?? "http://localhost:3000";
   return ctx.mail.send(
     resetPasswordMessage({
       to: user.email,
@@ -4640,7 +4809,8 @@ function staffRoutes(ctx) {
         userId: owner.id,
         email: body.email,
         restaurantName: restaurant.name,
-        slug: restaurant.slug
+        slug: restaurant.slug,
+        requestOrigin: requestOrigin2(req)
       });
       res.status(201).json({
         ok: true,
@@ -4670,7 +4840,7 @@ function staffRoutes(ctx) {
     if (!ctx.limiter.hit(platformKey("reset", req.ip ?? "unknown"), 5, 9e5).allowed) {
       throw ApiError.tooMany("Too many reset requests. Wait a few minutes.");
     }
-    const delivery = await requestPasswordReset(ctx, body);
+    const delivery = await requestPasswordReset(ctx, { ...body, requestOrigin: requestOrigin2(req) });
     res.json({
       ok: true,
       message: "If that address has an account here, a reset link is on its way.",
@@ -4903,7 +5073,7 @@ function staffRoutes(ctx) {
       current: await pspSummary(ctx, t),
       available: describeProviders(t.restaurant.currency),
       currency: t.restaurant.currency,
-      webhookUrl: `${publicUrl(req)}/api/webhooks/psp/${t.restaurant.webhookToken}`
+      webhookUrl: `${await publicUrl(req)}/api/webhooks/psp/${t.restaurant.webhookToken}`
     }));
     res.json({ ok: true, ...out });
   });
@@ -4951,7 +5121,7 @@ function staffRoutes(ctx) {
   );
   router.post("/payments/go-live", requireStaff("settings.manage"), async (req, res) => {
     const result = await asTenant(req, async (t) => {
-      const origin = publicUrl(req);
+      const origin = await publicUrl(req);
       const out = await attemptGoLive(ctx, t, {
         returnUrl: `${origin}/${t.restaurant.slug}`,
         cancelUrl: `${origin}/${t.restaurant.slug}`,
@@ -5091,7 +5261,7 @@ function staffRoutes(ctx) {
     const out = await asTenant(req, async (t) => {
       const table = await t.tables.byId(String(req.params.id));
       if (!table) return null;
-      return { url: tableUrl(publicUrl(req), t.restaurant.slug, table.code) };
+      return { url: tableUrl(await publicUrl(req), t.restaurant.slug, table.code) };
     });
     if (!out) throw ApiError.notFound("No such table.");
     res.type("image/svg+xml").send(await tableQrSvg(out.url));
@@ -5102,7 +5272,7 @@ function staffRoutes(ctx) {
       slug: t.restaurant.slug,
       tables: (await t.tables.list()).map((x) => ({ code: x.code, label: x.label }))
     }));
-    res.type("html").send(await printableSheet({ ...out, publicUrl: publicUrl(req) }));
+    res.type("html").send(await printableSheet({ ...out, publicUrl: await publicUrl(req) }));
   });
   router.post("/sessions", requireStaff("session.open"), async (req, res) => {
     const body = openSessionSchema.parse(req.body);
@@ -5179,9 +5349,12 @@ function staffRoutes(ctx) {
     }
   );
   return router;
-  function publicUrl(req) {
-    return ctx.publicUrl ?? `${req.protocol}://${req.get("host") ?? "localhost:3000"}`;
+  async function publicUrl(req) {
+    return await ctx.publicUrls.get() ?? requestOrigin2(req);
   }
+}
+function requestOrigin2(req) {
+  return `${req.protocol}://${req.get("host") ?? "localhost:3000"}`;
 }
 
 // apps/server/src/routes/mock.ts
@@ -5191,7 +5364,7 @@ function mockRoutes(ctx) {
   const router = Router3({ mergeParams: true });
   async function tenantOr404(req) {
     const slug = String(req.params.slug ?? "");
-    const restaurant = await ctx.registry.bySlug(slug);
+    const restaurant = await ctx.registry.byLinkSlug(slug);
     if (!restaurant) throw ApiError.notFound("No such restaurant.");
     if (!restaurant.mockMode) throw ApiError.notFound("Not found.");
     return restaurant;
@@ -5275,7 +5448,7 @@ function payRoutes(ctx) {
   router.get("/:reference", async (req, res) => {
     const slug = String(req.params.slug ?? "");
     const reference = String(req.params.reference ?? "");
-    const restaurant = await ctx.registry.bySlug(slug);
+    const restaurant = await ctx.registry.byLinkSlug(slug);
     if (!restaurant) throw ApiError.notFound("No such restaurant.");
     const out = await ctx.tenant(restaurant.id, async (t) => {
       const payment = await t.payments.byReference(reference);
@@ -5285,7 +5458,7 @@ function payRoutes(ctx) {
       }
       const session = await t.sessions.byId(payment.sessionId);
       const table = session ? await t.tables.byId(session.tableId) : null;
-      const origin = ctx.publicUrl ?? `${req.protocol}://${req.get("host") ?? "localhost:3000"}`;
+      const origin = await ctx.publicUrls.get() ?? requestOrigin3(req);
       const tableUrl2 = `${origin}/${restaurant.slug}/t/${encodeURIComponent(table?.code ?? "")}`;
       const psp = await resolvePsp(ctx, t, {
         returnUrl: `${tableUrl2}?paid=1`,
@@ -5346,6 +5519,9 @@ function esc(s) {
     /[&<>"']/g,
     (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]
   );
+}
+function requestOrigin3(req) {
+  return `${req.protocol}://${req.get("host") ?? "localhost:3000"}`;
 }
 
 // apps/server/src/routes/webhooks.ts
@@ -5501,7 +5677,7 @@ function webhookRoutes(ctx) {
       res.sendStatus(401);
       return;
     }
-    const origin = ctx.publicUrl ?? `${req.protocol}://${req.get("host") ?? "localhost:3000"}`;
+    const origin = await ctx.publicUrls.get() ?? requestOrigin4(req);
     const outcome = await ctx.tenant(restaurant.id, async (t) => {
       let psp;
       try {
@@ -5605,6 +5781,9 @@ function webhookRoutes(ctx) {
   router.post("/psp/:webhookToken", express.raw({ type: "*/*", limit: "1mb" }), handler);
   router.post("/paystack/:webhookToken", express.raw({ type: "*/*", limit: "1mb" }), handler);
   return router;
+}
+function requestOrigin4(req) {
+  return `${req.protocol}://${req.get("host") ?? "localhost:3000"}`;
 }
 
 // apps/server/src/routes/sentinel.ts
@@ -5809,6 +5988,27 @@ function sentinelRoutes(ctx) {
     );
     res.json({ ok: true });
   });
+  router.get("/public-url", requireOperator(), async (req, res) => {
+    res.json({
+      ok: true,
+      url: await ctx.publicUrls.get() ?? "",
+      pinnedByEnvironment: ctx.publicUrls.pinnedByEnvironment,
+      // What the operator is looking at right now, which is nearly always the
+      // answer -- but offered as a suggestion, never applied on their behalf.
+      suggestion: `${req.protocol}://${req.get("host") ?? ""}`
+    });
+  });
+  router.put("/public-url", requireOperator(), async (req, res) => {
+    if (ctx.publicUrls.pinnedByEnvironment) {
+      throw ApiError.badRequest("PUBLIC_URL is set in the environment, so it cannot be changed here.");
+    }
+    const body = publicUrlSchema.parse(req.body);
+    try {
+      res.json({ ok: true, url: await ctx.publicUrls.set(body.url) });
+    } catch (err) {
+      throw ApiError.badRequest(err.message);
+    }
+  });
   router.get("/smtp", requireOperator(), async (_req, res) => {
     const settings = await ctx.mail.settings();
     res.json({
@@ -5858,6 +6058,11 @@ function createApp(ctx) {
   app.set("trust proxy", ctx.trustProxy ? 1 : false);
   app.disable("x-powered-by");
   app.use("/api/webhooks", webhookRoutes(ctx));
+  app.post(
+    "/:slug/t/:code/scan",
+    guardSlug,
+    express2.json({ limit: MAX_BILL_IMAGE_BASE64 + 64 * 1024, inflate: false })
+  );
   app.use(express2.json({ limit: "256kb" }));
   app.use(express2.urlencoded({ extended: false, limit: "64kb" }));
   app.use(cookieParser());
@@ -6186,6 +6391,7 @@ async function createContext(options = {}) {
     appKeySource,
     version: options.version ?? "1.0.0",
     publicUrl: env.PUBLIC_URL ?? null,
+    publicUrls: new PublicUrlStore(db, env.PUBLIC_URL ?? null),
     // Default false. With this on and no proxy actually in front, req.ip comes
     // straight from a client-supplied header and every IP-keyed rate limit --
     // including the one throttling table-code guesses -- is spoofable.
